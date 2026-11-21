@@ -637,13 +637,23 @@ def process_mailbox():
     keywords = [x.strip().lower() for x in raw_keywords.split(",") if x.strip()]
     host = imap_host(user)
 
+    # 163 / 126 邮箱必须先在 AUTH 状态发送 ID 客户端标识，否则 SELECT 会报
+    # "Unsafe Login. Please contact kefu@188.com for help"。
+    imaplib.Commands["ID"] = ("AUTH", "SELECTED")
     imap = imaplib.IMAP4_SSL(host, 993)
     try:
         imap.login(user, auth)
     except Exception as e:
         raise RuntimeError("网易邮箱登录失败：确认已开启 IMAP，且 NETEASE_PASS 填的是授权码不是登录密码") from e
     try:
-        imap.select("INBOX")
+        try:
+            imap._simple_command("ID", '("name" "yancheng-mail" "version" "1.0" "vendor" "yancheng")')
+            imap._untagged_response("OK", [None], "ID")
+        except Exception as e:
+            log("IMAP ID 发送失败（继续尝试 SELECT）:", str(e)[:120])
+        status, data = imap.select("INBOX")
+        if status != "OK":
+            raise RuntimeError("选择收件箱失败: %s %s" % (status, data))
         payload = load_payload(shop)
         total_added = 0
         for num in recent_message_ids(imap, 14):
