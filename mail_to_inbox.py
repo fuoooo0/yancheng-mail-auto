@@ -487,30 +487,75 @@ def blank_payload():
     }
 
 
+def norm_imei(v):
+    return re.sub(r"\D", "", clean_text(v))
+
+
+def history_index(payload):
+    """返回 (已出现过的 IMEI, 已出现过的单号, 已出现过的记录 id)。
+
+    库存、销售、采购、退货、待入库（含已退货）和删除墓碑都要查。
+    这样机器卖出后即使从库存里删掉，也不会被旧邮件重新加回待入库。
+    """
+    imeis, pos, ids = set(), set(), set()
+
+    def scan(rec):
+        if not isinstance(rec, dict):
+            return
+        im = norm_imei(rec.get("imei"))
+        if im:
+            imeis.add(im)
+        for f in ("poNo", "orderNo", "order", "itemNo"):
+            v = clean_text(rec.get(f))
+            if v:
+                pos.add(v)
+        rid = clean_text(rec.get("id"))
+        if rid:
+            ids.add(rid)
+
+    for name in ("devices", "sales", "purch", "returns", "inbox"):
+        for rec in payload.get(name, []) or []:
+            scan(rec)
+    # 删除墓碑里也保留 IMEI，防止删掉已售机器后旧邮件把它加回来
+    for tr in payload.get("trash", []) or []:
+        if not isinstance(tr, dict):
+            continue
+        im = norm_imei(tr.get("imei"))
+        if im:
+            imeis.add(im)
+        rid = clean_text(tr.get("id"))
+        if rid:
+            ids.add(rid)
+    return imeis, pos, ids
+
+
 def merge_records(payload, records, source, batch_label):
     payload.setdefault("inbox", [])
     payload.setdefault("devices", [])
     payload.setdefault("meta", {})
-    existing_pending = {
-        (clean_text(x.get("poNo")), clean_text(x.get("imei")))
-        for x in payload["inbox"] if x.get("status") != "已退货"
-    }
-    existing_devices = {
-        (clean_text(x.get("poNo")), clean_text(x.get("imei")))
-        for x in payload["devices"]
-    }
-    ids = {clean_text(x.get("id")) for x in payload["inbox"]}
+    known_imei, known_po, known_ids = history_index(payload)
     now = int(time.time() * 1000)
     batch_id = "b" + str(now) + "_" + os.urandom(2).hex()
-    added = 0
+    added = skipped = 0
     for idx, r in enumerate(records):
-        key = (r["poNo"], r["imei"])
-        if key in existing_pending or key in existing_devices:
+        im = norm_imei(r.get("imei"))
+        po = clean_text(r.get("poNo"))
+        if not im and not po:
+            skipped += 1
             continue
-        base_id = "ib_" + (r["imei"] or r["poNo"])
+        # 有完整 IMEI 时只按 IMEI 判重：同一订单可能有多台手机，
+        # 不能因为订单号相同就把第二台误判成重复。
+        if len(im) >= 14:
+            if im in known_imei:
+                skipped += 1
+                continue
+        elif po and po in known_po:
+            skipped += 1
+            continue
+        base_id = "ib_" + (im or po)
         rid = base_id
         n = 2
-        while rid in ids:
+        while rid in known_ids:
             rid = base_id + "_" + str(n)
             n += 1
         rec = {
@@ -535,12 +580,15 @@ def merge_records(payload, records, source, batch_label):
         payload["meta"]["i:" + rid] = {
             "h": rec_hash(rec), "t": now + idx, "imei": r["imei"],
         }
-        ids.add(rid)
-        existing_pending.add(key)
+        known_ids.add(rid)
+        if im:
+            known_imei.add(im)
+        if po:
+            known_po.add(po)
         added += 1
     if added:
         payload["rev"] = int(payload.get("rev") or 0) + 1
-    return added
+    return added, skipped
 
 
 def supabase_base():
@@ -558,9 +606,17 @@ def supabase_headers():
     }
 
 
-def load_payload(shop_code):
+def mail_log_code(shop_code):
+    return shop_code + "_mail_log"
+
+
+class PayloadConflict(Exception):
+    pass
+
+
+def load_payload_state(shop_code):
     base = supabase_base()
-    url = base + "/rest/v1/shop_erp?shop_code=eq." + urllib.parse.quote(shop_code) + "&select=payload"
+    url = base + "/rest/v1/shop_erp?shop_code=eq." + urllib.parse.quote(shop_code) + "&select=payload,updated_at"
     req = urllib.request.Request(url, headers=supabase_headers())
     with urllib.request.urlopen(req, timeout=30) as resp:
         rows = json.loads(resp.read().decode("utf-8"))
@@ -569,8 +625,12 @@ def load_payload(shop_code):
         p.setdefault("inbox", [])
         p.setdefault("meta", {})
         p.setdefault("devices", [])
-        return p
-    return blank_payload()
+        return p, (clean_text(p.get("rev")) if p.get("rev") is not None else "")
+    return blank_payload(), ""
+
+
+def load_payload(shop_code):
+    return load_payload_state(shop_code)[0]
 
 
 def save_payload(shop_code, payload):
@@ -580,6 +640,62 @@ def save_payload(shop_code, payload):
     with urllib.request.urlopen(req, timeout=30) as resp:
         if resp.status not in (200, 201, 204):
             raise RuntimeError("Supabase HTTP " + str(resp.status))
+
+
+def save_payload_cas(shop_code, payload, expected_rev):
+    """带 rev 条件写入，避免覆盖 ERP 同时上传的修改。
+
+    ERP 每次本地改动会把 payload.rev +1；写入前带上旧 rev 做条件，云端 rev
+    已经变了就冲突，调用方保留邮件为未处理，下一轮再试。
+    """
+    if not expected_rev:
+        save_payload(shop_code, payload)
+        return clean_text(payload.get("rev"))
+    base = supabase_base()
+    url = (base + "/rest/v1/shop_erp?shop_code=eq." + urllib.parse.quote(shop_code)
+           + "&payload->>rev=eq." + urllib.parse.quote(clean_text(expected_rev)))
+    body = json.dumps({"payload": payload}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    headers = supabase_headers()
+    headers["Prefer"] = "return=representation"
+    req = urllib.request.Request(url, data=body, headers=headers, method="PATCH")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        text = resp.read().decode("utf-8")
+        rows = json.loads(text) if text else []
+    if rows:
+        return clean_text((rows[0].get("payload") or {}).get("rev"))
+    raise PayloadConflict("ERP 同时在改库存")
+
+
+def load_mail_log_state(shop_code):
+    base = supabase_base()
+    url = base + "/rest/v1/shop_erp?shop_code=eq." + urllib.parse.quote(mail_log_code(shop_code)) + "&select=payload,updated_at"
+    req = urllib.request.Request(url, headers=supabase_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        rows = []
+    log = rows[0].get("payload") if rows and isinstance(rows[0].get("payload"), dict) else {}
+    if not isinstance(log, dict):
+        log = {}
+    log.setdefault("seen", {})
+    log.setdefault("rev", 0)
+    log["v"] = 1
+    return log, (clean_text(log.get("rev")) if log.get("rev") else "")
+
+
+def load_mail_log(shop_code):
+    return load_mail_log_state(shop_code)[0]
+
+
+def save_mail_log(shop_code, mail_log, expected_rev=""):
+    seen = mail_log.get("seen") or {}
+    # 只保留最近 500 封，避免无限增长；按处理时间排序
+    if len(seen) > 500:
+        keep = sorted(seen.items(), key=lambda kv: (kv[1] or {}).get("at", 0), reverse=True)[:500]
+        mail_log["seen"] = dict(keep)
+    mail_log["rev"] = max(int(mail_log.get("rev") or 0), int(expected_rev or 0)) + 1
+    return save_payload_cas(mail_log_code(shop_code), mail_log, expected_rev)
 
 
 def imap_host(user):
@@ -617,16 +733,31 @@ def attachment_files(msg):
     return out
 
 
-def recent_message_ids(imap, days):
+def recent_message_uids(imap, days):
     since = (date.today() - timedelta(days=days)).strftime("%d-%b-%Y")
-    status, data = imap.search(None, "SINCE", since)
-    if status != "OK":
+    status, data = imap.uid("search", None, "SINCE", since)
+    if status != "OK" or not data or not data[0]:
         return []
     return data[0].split()
 
 
+def current_uidvalidity(imap):
+    vals = imap.untagged_responses.get("UIDVALIDITY") or []
+    if not vals:
+        return "0"
+    v = vals[-1]
+    return v.decode("utf-8", "ignore") if isinstance(v, bytes) else str(v)
+
+
 def header_text(msg):
     return (decode_mime(msg.get("From")) + " " + decode_mime(msg.get("Subject"))).lower()
+
+
+def message_key(msg, uid, uidvalidity):
+    mid = clean_text(msg.get("Message-ID") or msg.get("Message-Id"))
+    if mid:
+        return "mid:" + mid
+    return "uid:%s:%s" % (uidvalidity, clean_text(uid))
 
 
 def process_mailbox():
@@ -654,17 +785,25 @@ def process_mailbox():
         status, data = imap.select("INBOX")
         if status != "OK":
             raise RuntimeError("选择收件箱失败: %s %s" % (status, data))
-        payload = load_payload(shop)
+        payload, payload_rev = load_payload_state(shop)
+        mail_log, mail_log_rev = load_mail_log_state(shop)
+        seen = mail_log["seen"]
+        uidv = current_uidvalidity(imap)
         total_added = 0
-        for num in recent_message_ids(imap, 14):
-            status, data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+        total_skipped_mail = 0
+        for uid in recent_message_uids(imap, 30):
+            status, data = imap.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])")
             if status != "OK" or not data or not data[0]:
                 continue
             head = email.message_from_bytes(data[0][1])
+            key = message_key(head, uid, uidv)
+            if key in seen:
+                total_skipped_mail += 1
+                continue
             text = header_text(head)
             if not any(k in text for k in keywords):
                 continue
-            status, data = imap.fetch(num, "(RFC822)")
+            status, data = imap.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not data or not data[0]:
                 continue
             msg = email.message_from_bytes(data[0][1])
@@ -672,25 +811,58 @@ def process_mailbox():
             source = "拍机堂" if ("拍机堂" in text or "paijitang" in text) else "采货侠"
             files = attachment_files(msg)
             if not files:
+                # 主题像账单但没附件：记成已处理，避免每 5 分钟反复读
+                seen[key] = {"at": int(time.time() * 1000), "subject": subject[:80],
+                             "status": "no_attachment", "added": 0, "skipped": 0}
+                try:
+                    mail_log_rev = save_mail_log(shop, mail_log, mail_log_rev)
+                except PayloadConflict:
+                    log("检测到 ERP 同时修改云端，本轮先不标记这封邮件，下一轮重试")
+                    return
+                try:
+                    imap.uid("store", uid, "+FLAGS", "\\Seen")
+                except Exception:
+                    pass
+                log("邮件", subject[:60], "没有 xlsx/csv 附件，已标记为已读")
                 continue
             added_this = 0
+            skipped_this = 0
+            failed = 0
             for filename, blob in files:
                 try:
                     records, st = parse_bill_bytes(blob, filename)
                 except Exception as e:
-                    log("跳过附件", filename, "解析失败:", str(e)[:120])
+                    failed += 1
+                    log("附件", filename, "解析失败，下次重试:", str(e)[:120])
                     continue
-                added = merge_records(payload, records, source, subject + " · " + Path(filename).stem)
+                added, skipped = merge_records(payload, records, source, subject + " · " + Path(filename).stem)
                 added_this += added
-                log(f"账单 {filename}: 读到 {st['total']} 单，新增 {added} 台，退款 {st['refunded']}，取消 {st['cancel']}，非手机 {st['other']}")
+                skipped_this += skipped
+                log(f"账单 {filename}: 读到 {st['total']} 单，新增 {added} 台，跳过重复/已售 {skipped} 台，退款 {st['refunded']}，取消 {st['cancel']}，非手机 {st['other']}")
             if added_this:
+                try:
+                    payload_rev = save_payload_cas(shop, payload, payload_rev)
+                except PayloadConflict:
+                    log("检测到 ERP 同时修改云端，本轮先不写入，下一轮重试")
+                    return
                 total_added += added_this
-                save_payload(shop, payload)
+            if failed:
+                # 有附件没解析成功，不记已读，下一轮继续重试；已成功入库的部分有历史查重兜底
+                log("邮件", subject[:60], "有附件解析失败，保留为未处理")
+                continue
+            # 全部附件解析成功（或本来就 0 条有效单）才算处理完，永久记已读
+            seen[key] = {"at": int(time.time() * 1000), "subject": subject[:80],
+                         "status": "ok", "added": added_this, "skipped": skipped_this}
             try:
-                imap.store(num, "+FLAGS", "\\Seen")
+                mail_log_rev = save_mail_log(shop, mail_log, mail_log_rev)
+            except PayloadConflict:
+                log("检测到 ERP 同时修改云端，本轮先不标记这封邮件，下一轮重试")
+                return
+            try:
+                imap.uid("store", uid, "+FLAGS", "\\Seen")
             except Exception:
                 pass
-        log("本次共新增待入库", total_added, "台")
+        log("本次共新增待入库", total_added, "台；跳过已处理邮件", total_skipped_mail, "封")
     finally:
         try:
             imap.logout()
